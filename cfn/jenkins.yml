@@ -1,0 +1,447 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Template to setup Jenkins stack in an ECS cluster in a dedicated VPC, with ELB and EFS
+
+
+Parameters:
+
+  Region:
+    Type: String
+    Default: "eu-west-1"
+
+  ClusterStackName:
+    Type: String
+    Description: "Stack name responsible for VPC and EFS setup"
+
+  InstanceType:
+    Type: "String"
+    Description: "EC2 instance type"
+    Default: "t2.small"
+    AllowedValues:
+      - "t2.small"
+      - "t2.medium"
+      - "t2.large"
+      - "m4.large"
+      - "m4.xlarge"
+      - "m4.2xlarge"
+      - "m4.4xlarge"
+      - "m4.10xlarge"
+    ConstraintDescription: "must be a general purpose (T2 or M4) EC2 instance type, equal to or larger than a \"t2.small\"."
+
+  KeyPair:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: "Key pair to log into EC2 instances"
+
+  PublicAccessCIDR:
+    Type: "String"
+    Description: "CIDR block that will have access to AWS resources. You can use http://ifconfig.io/ip ."
+    AllowedPattern: "\\d+\\.\\d+\\.\\d+\\.\\d+/\\d+"
+
+  ECSOptimizedAMI:
+    Type: "String"
+    Description: "AMI for ECS Cluster in choosen region (default Ireland)"
+    Default: "ami-175f1964"
+
+  ResourceNamePrefix:
+    Type: "String"
+    Description: "Naming prefix for created resources"
+    Default: "w-ats-ci-cfn-ecs"
+
+  ECSCluster:
+    Type: "String"
+    Description: 'Fn::ImportValue: !Sub "${ClusterStackName}-ECSCluster"'
+    AllowedPattern: ".+"
+
+  ECSClusterSecurityGroup:
+    Type: "String"
+    Description: 'Fn::ImportValue: !Sub "${ClusterStackName}-ECSClusterSecurityGroup"'
+    AllowedPattern: ".+"
+
+  EFSFileSystem:
+    Type: "String"
+    Description: 'Fn::ImportValue: !Sub "${ClusterStackName}-EFSFileSystem"'
+    AllowedPattern: ".+"
+
+  VPC:
+    Type: "String"
+    Description: 'Fn::ImportValue: !Sub "${ClusterStackName}-VPC"'
+    AllowedPattern: ".+"
+
+  ClusterSubnetList:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: 'Fn::ImportValue: !Sub "${ClusterStackName}-ClusterSubnetList"'
+
+  ECSJenkinsServiceCount:
+    Type: "Number"
+    Description: "Number of tasks ensured running by ECS Jenkins Service"
+    Default: 1
+
+  ECSProxyServiceCount:
+    Type: "Number"
+    Description: "Number of tasks ensured running by ECS Proxy Service"
+    Default: 1
+
+  ASGDesiredInstances:
+    Type: "Number"
+    Description: "Number of instances running in the ECS Autoscaling Group"
+    Default: 2
+
+
+Resources:
+
+  ECSAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: "PT5M"
+    Properties:
+      DesiredCapacity: !Ref ASGDesiredInstances
+      LaunchConfigurationName: !Ref ECSLaunchConfig
+      MaxSize: 10
+      MinSize: 0
+      VPCZoneIdentifier:
+        - !Select [0, !Ref ClusterSubnetList]
+        - !Select [1, !Ref ClusterSubnetList]
+      Tags:
+        -
+          Key: "Name"
+          Value: !Sub "${ResourceNamePrefix}-asg"
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: "1"
+        MinInstancesInService: "1"
+        PauseTime: "PT5M"
+        WaitOnResourceSignals: "true"
+
+  ECSLaunchConfig:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref ECSInstanceProfile
+      ImageId: !Ref ECSOptimizedAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPair
+      SecurityGroups:
+        - !Ref ECSClusterSecurityGroup
+        - !Ref ECSContainerInstancesSecurityGroup
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -xe
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ECSLaunchConfig --region ${AWS::Region}
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            mkdir -p /mnt/efs
+            aws_az="$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)"
+            echo "$aws_az.${EFSFileSystem}.efs.eu-west-1.amazonaws.com:/    /mnt/efs   nfs4    defaults" >> /etc/fstab
+            mount -a
+            chmod -R 777 /mnt/efs
+            service docker restart
+            start ecs
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /etc/nginx/nginx.conf:
+              content: !Sub
+              - |
+                events {
+                    worker_connections 1024;
+                }
+                http {
+                  server {
+                    location / {
+                      proxy_pass http://${JenkinsDNSName};
+                      proxy_read_timeout 90;
+                      proxy_redirect default;
+                      proxy_set_header Host $host:$server_port;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Real-IP $remote_addr;
+                    }
+                  }
+                }
+              - { JenkinsDNSName: !GetAtt JenkinsLoadBalancer.DNSName }
+              mode: "000644"
+              owner: "root"
+              group: "root"
+          packages:
+            yum:
+              nfs-utils: []
+
+  ECSContainerInstancesSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Security group for ECS container instances"
+      SecurityGroupIngress:
+        -
+          IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: !Ref PublicAccessCIDR
+
+  ECSInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref ECSInstanceRole
+
+  ECSInstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "AmazonEC2ContainerServiceforEC2Role"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "ecs:CreateCluster"
+                  - "ecs:DeregisterContainerInstance"
+                  - "ecs:DiscoverPollEndpoint"
+                  - "ecs:Poll"
+                  - "ecs:RegisterContainerInstance"
+                  - "ecs:ListContainerInstances"
+                  - "ecs:StartTelemetrySession"
+                  - "ecs:Submit*"
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+        -
+          PolicyName: "AmazonEC2ContainerServiceJenkinsPluginRole"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "ecs:DescribeContainerInstances"
+                  - "ecs:ListClusters"
+                  - "ecs:RegisterTaskDefinition"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "ecs:RunTask"
+                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/jenkins-slave:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "ecs:ListContainerInstances"
+                  - "ecs:StopTask"
+                Resource: !Sub
+                       - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+                Effect: "Allow"
+                Action:
+                  - "ecs:StopTask"
+                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*"
+
+  ECSServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "AmazonEC2ContainerServiceRole"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "ec2:AuthorizeSecurityGroupIngress"
+                  - "ec2:Describe*"
+                  - "elasticloadbalancing:DeregisterInstancesFromLoadBalancer"
+                  - "elasticloadbalancing:Describe*"
+                  - "elasticloadbalancing:RegisterInstancesWithLoadBalancer"
+                Resource: "*"
+
+  JenkinsLoadBalancer:
+    Type: "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      LoadBalancerName: "jenkins-internal-ecs-elb"
+      Subnets:
+        - !Select [0, !Ref ClusterSubnetList]
+        - !Select [1, !Ref ClusterSubnetList]
+      Scheme: "internal"
+      SecurityGroups:
+        - !Ref ECSClusterSecurityGroup
+      Listeners:
+        -
+          InstancePort: "8080"
+          InstanceProtocol: "HTTP"
+          LoadBalancerPort: "80"
+          Protocol: "HTTP"
+        -
+          InstancePort: "50000"
+          InstanceProtocol: "TCP"
+          LoadBalancerPort: "50000"
+          Protocol: "TCP"
+      HealthCheck:
+        HealthyThreshold: "2"
+        Interval: "30"
+        Target: "HTTP:8080/"
+        Timeout: "5"
+        UnhealthyThreshold: "5"
+
+  ProxyELBSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Proxy ELB security group"
+      SecurityGroupIngress:
+        -
+          IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref PublicAccessCIDR
+
+  ProxyLoadBalancer:
+    Type: "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      LoadBalancerName: "jenkins-external-ecs-elb"
+      Subnets:
+        - !Select [0, !Ref ClusterSubnetList]
+        - !Select [1, !Ref ClusterSubnetList]
+      SecurityGroups:
+        - !Ref ECSClusterSecurityGroup
+        - !Ref ProxyELBSecurityGroup
+      Listeners:
+        -
+          InstancePort: "80"
+          InstanceProtocol: "HTTP"
+          LoadBalancerPort: "80"
+          Protocol: "HTTP"
+      HealthCheck:
+        HealthyThreshold: "2"
+        Interval: "30"
+        Target: "HTTP:80/"
+        Timeout: "5"
+        UnhealthyThreshold: "5"
+
+  JenkinsECSService:
+    Type: "AWS::ECS::Service"
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: !Ref ECSJenkinsServiceCount
+      LoadBalancers:
+        -
+          ContainerName: "jenkins"
+          ContainerPort: "8080"
+          LoadBalancerName: !Ref JenkinsLoadBalancer
+      Role: !Ref ECSServiceRole
+      TaskDefinition: !Ref JenkinsTaskDefinition
+
+  JenkinsTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        -
+          Name: "jenkins"
+          Image: "jenkins"
+          Hostname: "jenkins"
+          Cpu: 512
+          Memory: 512
+          Environment:
+            -
+              Name: "JAVA_OPTS"
+              Value: "-Djenkins.install.runSetupWizard=false"
+          Essential: true
+          MountPoints:
+            -
+              ContainerPath: "/var/jenkins_home"
+              SourceVolume: "efs-jenkins"
+          PortMappings:
+            -
+              HostPort: 8080
+              ContainerPort: 8080
+            -
+              HostPort: 50000
+              ContainerPort: 50000
+      Volumes:
+        -
+          Name: "efs-jenkins"
+          Host:
+            SourcePath: "/mnt/efs"
+
+  ProxyECSService:
+    Type: "AWS::ECS::Service"
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: !Ref ECSProxyServiceCount
+      LoadBalancers:
+        -
+          ContainerName: "nginx"
+          ContainerPort: "80"
+          LoadBalancerName: !Ref ProxyLoadBalancer
+      Role: !Ref ECSServiceRole
+      TaskDefinition: !Ref ProxyTaskDefinition
+
+  ProxyTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        -
+          Name: "nginx"
+          Image: "nginx"
+          Hostname: "nginx"
+          Cpu: 256
+          Memory: 256
+          Essential: true
+          MountPoints:
+            -
+              ContainerPath: "/etc/nginx/nginx.conf"
+              SourceVolume: "nginx-conf"
+              ReadOnly: true
+          PortMappings:
+            -
+              HostPort: 80
+              ContainerPort: 80
+      Volumes:
+        -
+          Name: "nginx-conf"
+          Host:
+            SourcePath: "/etc/nginx/nginx.conf"
+
+
+Outputs:
+  JenkinsConfigurationAlternativeJenkinsURL:
+    Description: "Jenkins configuration: \"Alternative Jenkins URL\""
+    Value: !Sub
+        - "http://${JenkinsDnsName}/"
+        - { JenkinsDnsName: !GetAtt JenkinsLoadBalancer.DNSName }
+  JenkinsConfigurationECSCluster:
+    Description: "Jenkins configuration: \"ECS Cluster\""
+    Value: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+  PublicJenkinsURL:
+    Description: "URL of proxy used to view Jenkins externally"
+    Value: !Sub
+        - "http://${JenkinsDnsName}/"
+        - { JenkinsDnsName: !GetAtt ProxyLoadBalancer.DNSName }
